@@ -1,0 +1,87 @@
+# ==============================================================================
+# HACKIOS GM 5 PLUS (MSM8952) .gitignore
+# Strictly prevents leaking tokens, device calibration, firmware and binaries.
+# ==============================================================================
+
+# --- Güvenlik & Token'lar (Secret Protection) ---
+.env
+.env.*
+*.pem
+*.key
+*.token
+*.secret
+credentials.json
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# --- Cihaz Kalibrasyonu & Hassas Donanım İmajları (Hardware Security) ---
+persist*
+modemst*
+fsg*
+fsc*
+*.raw
+*.qcn
+*.backup
+*.bak
+
+# --- Apple Telifli Dosyaları & Firmware (Proprietary / Copyrighted) ---
+*.ipsw
+*.dmg
+*.apfs
+*.simg
+*dyld_shared_cache*
+*.symbols
+Firmware/
+Cryptexes/
+firmware/
+sysimage/
+rootfs/
+20F66__iPhone10,3_6/
+
+# --- Derleme Çıktıları & Geçici İkili Dosyalar (Build Artifacts) ---
+*.o
+*.a
+*.dylib
+*.bin
+*.img
+out/
+build/
+BUILD/
+prebuilt/
+obj/
+*.tar.gz
+*.zip
+*.ppm
+
+# --- Loglar & İzleme Dosyaları (Logs & Traces) ---
+*.log
+logs/
+tracev3/
+*.crash
+*.ips
+graphify-out/
+deepseekinyaptiklari.md
+
+# --- IDE & Sistem ---
+.DS_Store
+.vscode/
+.idea/
+*~
+*.swp
+*.swo
+__pycache__/
+*.pyc
+.agents/
+
+# Sub-repositories and external trees
+hackios/
+hackios-userland/
+ios-sweet/
+shamrock-device/
+shamrock-kernel/
+shim-shamrock/
+tools/
+repos/
+scripts/
