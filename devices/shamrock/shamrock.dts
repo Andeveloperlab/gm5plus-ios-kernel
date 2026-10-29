@@ -1,0 +1,33 @@
+/dts-v1/;
+// version:		17
+// last_comp_version:	16
+// boot_cpuid_phys:	0x0
+
+/ {
+    model = "General Mobile GM 5 Plus";
+    compatible = "generalmobile,shamrock", "qcom,msm8952";
+    qcom,msm-id = <0x00000108 0x00000000 0x00000108 0x00010000 0x00000108 0x00020000 0x00000108 0x00030000>;
+    qcom,board-id = <0x0001000b 0x00000000 0x0000000b 0x00000000 0x00010008 0x00000000 0x00000008 0x00000000 0x00000000 0x00000000>;
+    #address-cells = <0x00000002>;
+    #size-cells = <0x00000002>;
+    chosen {
+        bootargs = "console=ttyHSL0,115200,n8 androidboot.hardware=qcom";
+    };
+    memory {
+        device_type = "memory";
+        reg = <0x00000000 0x80000000 0x00000000 0xc0000000>;
+    };
+    reserved-memory {
+        #address-cells = <0x00000002>;
+        #size-cells = <0x00000002>;
+        ranges;
+        splash_region@83000000 {
+            reg = <0x00000000 0x83000000 0x00000000 0x01400000>;
+            label = "cont_splash_mem";
+        };
+        ramoops_region@dffc0000 {
+            reg = <0x00000000 0xdffc0000 0x00000000 0x00040000>;
+            label = "ramoops_mem";
+        };
+    };
+};
