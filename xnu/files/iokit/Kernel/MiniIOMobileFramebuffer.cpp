@@ -1194,12 +1194,23 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
 			if (!fGraphics) {
-				/* the first picture: the kernel's text console must stop drawing over it */
+				/* the first picture: mark fGraphics but DO NOT call PE_initialize_console */
 				fGraphics = true;
-				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
-			if (report) { IOLog("MiniIOMobileFramebuffer: drawLayer in (fBase %p depth %u panel %ux%u row %u) pixels %p kpixels %p off %u stride %u alloc %u\n", fBase, fDepth, fPanelWidth, fPanelHeight, fRowBytes, s->pixels(), s->kpixels, (unsigned) s->info.offset, (unsigned) s->info.bytesPerRow, (unsigned) s->info.allocSize); { volatile uint32_t t = *(volatile uint32_t *) s->pixels(); IOLog("MiniIOMobileFramebuffer: first pixel read %#x\n", t); t = ((volatile uint32_t *) s->pixels())[(size_t) 1000 * s->info.bytesPerRow / 4]; IOLog("MiniIOMobileFramebuffer: row 1000 read %#x\n", t); *(volatile uint8_t *) fBase = *(volatile uint8_t *) fBase; IOLog("MiniIOMobileFramebuffer: fb touch ok\n"); } }
+			if (report) {
+				IOLog("MiniIOMobileFramebuffer: drawLayer in (fBase %p depth %u panel %ux%u row %u) pixels %p kpixels %p off %u stride %u alloc %u\n",
+				    fBase, fDepth, fPanelWidth, fPanelHeight, fRowBytes, s->pixels(), s->kpixels,
+				    (unsigned) s->info.offset, (unsigned) s->info.bytesPerRow, (unsigned) s->info.allocSize);
+				volatile uint32_t t = *(volatile uint32_t *) s->pixels();
+				IOLog("MiniIOMobileFramebuffer: first pixel read %#x\n", t);
+				t = ((volatile uint32_t *) s->pixels())[(size_t) 1000 * s->info.bytesPerRow / 4];
+				IOLog("MiniIOMobileFramebuffer: row 1000 read %#x\n", t);
+				*(volatile uint8_t *) fBase = *(volatile uint8_t *) fBase;
+				IOLog("MiniIOMobileFramebuffer: fb touch ok\n");
+			}
+			IOLog("MiniIOMobileFramebuffer: starting drawLayer...\n");
 			drawLayer(s, src, dst);
+			IOLog("MiniIOMobileFramebuffer: drawLayer done!\n");
 			if (report) { IOLog("MiniIOMobileFramebuffer: drawLayer out\n"); }
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */

@@ -2153,6 +2153,8 @@ cawindowserver_trace_fixes(void)
  * ============================================================================ */
 static IMP orig_CAContext_localWithOptions  = NULL;
 static IMP orig_CAContext_remoteWithOptions = NULL;
+static IMP orig_CAContext_local              = NULL;
+static IMP orig_CAContext_remote             = NULL;
 
 static CFDictionaryRef hakios_patch_cacontext_options(CFDictionaryRef opts) {
 	CFMutableDictionaryRef m = opts
@@ -2161,7 +2163,6 @@ static CFDictionaryRef hakios_patch_cacontext_options(CFDictionaryRef opts) {
 		                            &kCFTypeDictionaryKeyCallBacks,
 		                            &kCFTypeDictionaryValueCallBacks);
 	if (m) {
-		// CA::WindowServer::IOMFBDisplay::ignore_update_p kilidini açan anahtar!
 		CFDictionarySetValue(m, CFSTR("definesDisplayBounds"), kCFBooleanTrue);
 	}
 	return m;
@@ -2185,6 +2186,34 @@ static id hooked_CAContext_remoteWithOptions(id self, SEL _cmd, CFDictionaryRef 
 	return ctx;
 }
 
+static id hooked_CAContext_local(id self, SEL _cmd) {
+	say("hakios: +[CAContext localContext] called -> redirecting with definesDisplayBounds=YES\n");
+	CFDictionaryRef patched = hakios_patch_cacontext_options(NULL);
+	id ctx = nil;
+	if (orig_CAContext_localWithOptions) {
+		ctx = ((id (*)(id, SEL, CFDictionaryRef))orig_CAContext_localWithOptions)(
+			self, sel_registerName("localContextWithOptions:"), patched);
+	} else if (orig_CAContext_local) {
+		ctx = ((id (*)(id, SEL))orig_CAContext_local)(self, _cmd);
+	}
+	if (patched) CFRelease(patched);
+	return ctx;
+}
+
+static id hooked_CAContext_remote(id self, SEL _cmd) {
+	say("hakios: +[CAContext remoteContext] called -> redirecting with definesDisplayBounds=YES\n");
+	CFDictionaryRef patched = hakios_patch_cacontext_options(NULL);
+	id ctx = nil;
+	if (orig_CAContext_remoteWithOptions) {
+		ctx = ((id (*)(id, SEL, CFDictionaryRef))orig_CAContext_remoteWithOptions)(
+			self, sel_registerName("remoteContextWithOptions:"), patched);
+	} else if (orig_CAContext_remote) {
+		ctx = ((id (*)(id, SEL))orig_CAContext_remote)(self, _cmd);
+	}
+	if (patched) CFRelease(patched);
+	return ctx;
+}
+
 static void hakios_install_cacontext_swap_trigger(void) {
 	// CoreAnimation'ın yerleşik CPU Software Renderer (sw_new_context) kullanmasını sağla
 	setenv("CA_DISABLE_GPU", "1", 1);
@@ -2196,16 +2225,28 @@ static void hakios_install_cacontext_swap_trigger(void) {
 		return;
 	}
 
-	Method mLocal = class_getClassMethod(caCtxCls, sel_registerName("localContextWithOptions:"));
-	if (mLocal) {
+	Method mLocalOpts = class_getClassMethod(caCtxCls, sel_registerName("localContextWithOptions:"));
+	if (mLocalOpts) {
 		orig_CAContext_localWithOptions = method_setImplementation(
-			mLocal, (IMP)hooked_CAContext_localWithOptions);
+			mLocalOpts, (IMP)hooked_CAContext_localWithOptions);
 	}
 
-	Method mRemote = class_getClassMethod(caCtxCls, sel_registerName("remoteContextWithOptions:"));
-	if (mRemote) {
+	Method mRemoteOpts = class_getClassMethod(caCtxCls, sel_registerName("remoteContextWithOptions:"));
+	if (mRemoteOpts) {
 		orig_CAContext_remoteWithOptions = method_setImplementation(
-			mRemote, (IMP)hooked_CAContext_remoteWithOptions);
+			mRemoteOpts, (IMP)hooked_CAContext_remoteWithOptions);
+	}
+
+	Method mLocal = class_getClassMethod(caCtxCls, sel_registerName("localContext"));
+	if (mLocal) {
+		orig_CAContext_local = method_setImplementation(
+			mLocal, (IMP)hooked_CAContext_local);
+	}
+
+	Method mRemote = class_getClassMethod(caCtxCls, sel_registerName("remoteContext"));
+	if (mRemote) {
+		orig_CAContext_remote = method_setImplementation(
+			mRemote, (IMP)hooked_CAContext_remote);
 	}
 
 	say("hakios: CAContext definesDisplayBounds swap trigger installed!\n");
@@ -2467,9 +2508,11 @@ hakios_init(void)
 		 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment
 		 * (CADeviceUseVBL()); on the iPhone X it runs a timer of its own instead (CADisplayTimer),
 		 * whose phase it would set from the frame timings of a display driver this one is not.
+		 * On MSM8952, GICv2 timer IRQ is not delivered reliably, so CA_FORCE_TIMER=1 would cause
+		 * WindowServer to deadlock waiting for hardware VSync before first frame. Keep CA_FORCE_TIMER=0.
 		 */
-		setenv("CA_FORCE_TIMER", "1", 1);
-		say("hakios: CA_FORCE_TIMER=1 set: CoreAnimation is forced to use display driver VSync notifications\n");
+		setenv("CA_FORCE_TIMER", "0", 1);
+		say("hakios: CA_FORCE_TIMER=0 set: CoreAnimation CADisplayTimer runs autonomously\n");
 		/*
 		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
 		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).

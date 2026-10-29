@@ -434,6 +434,7 @@ loader_return(void)
 	extern void vcputc_direct(char c);
 	const char *msg = "\n\n*** [SHAMROCK] loader_return() CALLED! ***\n";
 	for (const char *p = msg; *p; p++) vcputc_direct(*p);
+	loader_log_puts(msg);
 
 	uint64_t ret_pc = (uint64_t)__builtin_return_address(0);
 	char cbuf[64] = "Caller: 0x";
@@ -442,6 +443,7 @@ loader_return(void)
 	}
 	cbuf[26] = '\n'; cbuf[27] = 0;
 	for (const char *p = cbuf; *p; p++) vcputc_direct(*p);
+	loader_log_puts(cbuf);
 
 	/*
 	 * BRINGUP: while the kernel is stuck in a panic loop it never calls into
