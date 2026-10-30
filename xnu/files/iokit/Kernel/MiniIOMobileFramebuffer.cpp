@@ -31,6 +31,7 @@
 extern "C" {
 #include <console/video_console.h>
 extern struct vc_info vinfo;            /* the boot framebuffer, as the text console knows it */
+int hackios_graphics_owned;             /* (the panel is CoreAnimation's from the first frame on) */
 }
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -432,6 +433,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
 	fDepth = vinfo.v_depth;
+	IOLog("MiniIOMobileFramebuffer: framebuffer %p, panel %ux%u, row %u, depth %u\n", fBase, fPanelWidth, fPanelHeight, fRowBytes, fDepth);
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -1008,17 +1010,6 @@ IOMobileFramebuffer::reportFrameTimes(void)
 	fFramePauses = fFrameLongest = 0;
 }
 
-static inline void
-hakios_flush_panel(uintptr_t start, size_t len)
-{
-#if defined(__aarch64__)
-	for (uintptr_t a = start & ~(uintptr_t)63; a < start + len; a += 64) {
-		__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
-	}
-	__asm__ volatile ("dsb sy" ::: "memory");
-#endif
-}
-
 /* SwapEnd: the swap is handed to the thread that puts frames on the panel, as soon as that has no other waiting. */
 void
 IOMobileFramebuffer::present(const uint8_t * swap)
@@ -1194,31 +1185,30 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
 			if (!fGraphics) {
-				/* the first picture: mark fGraphics but DO NOT call PE_initialize_console */
+				/* The first picture: from here on the panel is CoreAnimation's.  The text
+				 * console's mirror of the kernel log (serial_putc_options in
+				 * pexpert/arm/pe_kprintf.c) stops painting it at the same moment --
+				 * every IOLog line used to paint one console line over the frame.  The
+				 * log itself still reaches the serial port, and panics still reach the
+				 * panel (debug.c calls vcputc_direct() itself). */
 				fGraphics = true;
+				hackios_graphics_owned = 1;
 			}
 			if (report) {
 				IOLog("MiniIOMobileFramebuffer: drawLayer in (fBase %p depth %u panel %ux%u row %u) pixels %p kpixels %p off %u stride %u alloc %u\n",
 				    fBase, fDepth, fPanelWidth, fPanelHeight, fRowBytes, s->pixels(), s->kpixels,
 				    (unsigned) s->info.offset, (unsigned) s->info.bytesPerRow, (unsigned) s->info.allocSize);
-				volatile uint32_t t = *(volatile uint32_t *) s->pixels();
-				IOLog("MiniIOMobileFramebuffer: first pixel read %#x\n", t);
-				t = ((volatile uint32_t *) s->pixels())[(size_t) 1000 * s->info.bytesPerRow / 4];
-				IOLog("MiniIOMobileFramebuffer: row 1000 read %#x\n", t);
-				*(volatile uint8_t *) fBase = *(volatile uint8_t *) fBase;
-				IOLog("MiniIOMobileFramebuffer: fb touch ok\n");
 			}
-			IOLog("MiniIOMobileFramebuffer: starting drawLayer...\n");
 			drawLayer(s, src, dst);
-			IOLog("MiniIOMobileFramebuffer: drawLayer done!\n");
-			if (report) { IOLog("MiniIOMobileFramebuffer: drawLayer out\n"); }
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
 		}
 	}
-	if (fGraphics && fBase != NULL) {
-		hakios_flush_panel((uintptr_t) fBase, (size_t) fPanelHeight * fRowBytes);     /* (the panel reads memory, not our cache) */
+	if (report && surfaces[0] != NULL) {
+		IOLog("MiniIOMobileFramebuffer: drawLayer out: src %p %ux%u stride %u, dst %p row %u depth %u\n",
+		    (const uint8_t *) surfaces[0]->pixels(), (unsigned) surfaces[0]->info.width,
+		    (unsigned) surfaces[0]->info.height, surfaces[0]->info.bytesPerRow, fBase, fRowBytes, fDepth);
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
@@ -1303,6 +1293,7 @@ class IOMobileFramebufferUserClient : public IOUserClient
 	thread_call_t           fVSyncCall;
 	uint64_t                fVSyncCount;
 	uint64_t                fVSyncTime;             /* when the refresh being waited for is due */
+	uint64_t                fVSyncFirst = 0;        /* the first refresh sent: for telling the rate */
 	bool                    fVSyncRunning;
 	bool                    fClosed;
 
@@ -1458,6 +1449,9 @@ IOMobileFramebufferUserClient::vsync(void)
 		fVSyncRunning = false;
 	} else {
 		fVSyncCount++;
+		if (fVSyncFirst == 0) {
+			fVSyncFirst = now;
+		}
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
 		args[0] = (uint32_t) now;
 		args[1] = now >> 32;
@@ -1467,6 +1461,13 @@ IOMobileFramebufferUserClient::vsync(void)
 		args[5] = fVSyncCount >> 32;
 		send = true;
 		armVSync();
+		if ((fVSyncCount & 127) == 1) {
+			uint64_t since;
+
+			absolutetime_to_nanoseconds(now - fVSyncFirst, &since);
+			IOLog("MiniIOMobileFramebuffer: vsync #%llu, %llu ms since the first, %u Hz\n",
+			    fVSyncCount, since / NSEC_PER_MSEC, refreshHz());
+		}
 	}
 	IOLockUnlock(fLock);
 	if (send) {

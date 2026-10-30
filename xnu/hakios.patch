@@ -3793,10 +3793,24 @@ index e5b23f2a2fbf..ce616549b2b4 100644
  
  	/* Check for the NMI string. */
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
-index 384118e8d7a9..fb5e685dd27a 100644
+index 384118e8d7a9..1c1ebbee5541 100644
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -299,7 +299,7 @@ gc_clear_line(unsigned int xx, unsigned int yy, int which)
+@@ -121,6 +121,13 @@ void noroot_icon_test(void);
+ 
+ 
+ extern int       disableConsoleOutput;
++/* (HAKIOS) Set by the framebuffer driver the moment it has a picture to show: from
++ * then on the text console must not paint the panel.  It still clears the whole
++ * screen when it is enabled (kPEAcquireScreen, from backboardd, lands in the middle
++ * of the first frame) and its boot spinner blits at the top left -- both of which
++ * wiped the frame the driver had just drawn.  The console's own output already goes
++ * to the serial port, so silencing the panel loses nothing. */
++extern int       hackios_graphics_owned;
+ static boolean_t gc_enabled     = FALSE;
+ static boolean_t gc_initialized = FALSE;
+ static boolean_t vm_initialized = FALSE;
+@@ -299,7 +306,7 @@ gc_clear_line(unsigned int xx, unsigned int yy, int which)
  	}
  }
  
@@ -3805,7 +3819,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  gc_clear_screen(unsigned int xx, unsigned int yy, int top, unsigned int bottom,
      int which)
  {
-@@ -337,7 +337,7 @@ gc_clear_screen(unsigned int xx, unsigned int yy, int top, unsigned int bottom,
+@@ -337,7 +344,7 @@ gc_clear_screen(unsigned int xx, unsigned int yy, int top, unsigned int bottom,
  	gc_ops.clear_screen(xx, yy, top, bottom, which);
  }
  
@@ -3814,7 +3828,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  gc_enable( boolean_t enable )
  {
  	unsigned char *buffer_attributes = NULL;
-@@ -1008,7 +1008,7 @@ gc_reset_vt100(void)
+@@ -1008,7 +1015,7 @@ gc_reset_vt100(void)
  	gc_update_color(COLOR_FOREGROUND, TRUE);
  }
  
@@ -3823,7 +3837,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  gc_scroll_down(int num, unsigned int top, unsigned int bottom)
  {
  	if (!gc_buffer_size) {
-@@ -1102,7 +1102,7 @@ gc_scroll_down(int num, unsigned int top, unsigned int bottom)
+@@ -1102,7 +1109,7 @@ gc_scroll_down(int num, unsigned int top, unsigned int bottom)
  	}
  }
  
@@ -3832,7 +3846,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  gc_scroll_up(int num, unsigned int top, unsigned int bottom)
  {
  	if (!gc_buffer_size) {
-@@ -1250,6 +1250,12 @@ vcputc(char c)
+@@ -1250,6 +1257,12 @@ vcputc(char c)
  	vcputc_options(c, false);
  }
  
@@ -3845,7 +3859,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  /*
   * Video Console (Back-End)
   * ------------------------
-@@ -1259,8 +1265,12 @@ vcputc(char c)
+@@ -1259,8 +1272,12 @@ vcputc(char c)
   * For the color support (Michel Pollet)
   */
  static unsigned char vc_color_index_table[33] =
@@ -3860,7 +3874,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  
  static uint32_t vc_colors[8][4] = {
  	{ 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000 },     /* black */
-@@ -1324,11 +1334,13 @@ static boolean_t vc_progress_white =
+@@ -1324,17 +1341,22 @@ static boolean_t vc_progress_white =
  
  static int vc_acquire_delay = kProgressAcquireDelay;
  
@@ -3876,7 +3890,16 @@ index 384118e8d7a9..fb5e685dd27a 100644
  	int      linelongs, col;
  	int      rowline, rowlongs;
  
-@@ -1368,6 +1380,23 @@ vc_clear_screen(unsigned int xx, unsigned int yy, unsigned int scrreg_top,
+ 	if (!vinfo.v_depth) {
+ 		return;
+ 	}
++	if (hackios_graphics_owned) {
++		return;                 /* (HAKIOS) the panel belongs to CoreAnimation now */
++	}
+ 
+ 	linelongs = vinfo.v_rowbytes * (ISO_CHAR_HEIGHT >> 2);
+ 	rowline = vinfo.v_rowscanbytes >> 2;
+@@ -1368,6 +1390,23 @@ vc_clear_screen(unsigned int xx, unsigned int yy, unsigned int scrreg_top,
  		break;
  	}
  
@@ -3900,7 +3923,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  	for (row = p; row < endp; row += rowlongs) {
  		for (col = 0; col < rowline; col++) {
  			*(row + col) = vc_color_back;
-@@ -1400,6 +1429,13 @@ vc_render_char(unsigned char ch, unsigned char *renderptr, short newdepth)
+@@ -1400,6 +1439,13 @@ vc_render_char(unsigned char ch, unsigned char *renderptr, short newdepth)
  				*current.shortptr++ = (*theChar & mask) ? 0xFFFF : 0;
  				break;
  
@@ -3914,7 +3937,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  			case 30:
  			case 32:
  				*current.longptr++ = (*theChar & mask) ? 0xFFFFFFFF : 0;
-@@ -1611,11 +1647,63 @@ vc_paint_char_32(unsigned int xx, unsigned int yy, unsigned char ch, int attrs,
+@@ -1611,11 +1657,63 @@ vc_paint_char_32(unsigned int xx, unsigned int yy, unsigned char ch, int attrs,
  	}
  }
  
@@ -3980,7 +4003,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  		return;
  	}
  
-@@ -1627,6 +1715,10 @@ vc_paint_char(unsigned int xx, unsigned int yy, unsigned char ch, int attrs,
+@@ -1627,6 +1725,10 @@ vc_paint_char(unsigned int xx, unsigned int yy, unsigned char ch, int attrs,
  		vc_paint_char_16(xx, yy, ch, attrs, ch_previous,
  		    attrs_previous);
  		break;
@@ -3991,7 +4014,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  	case 30:
  	case 32:
  		vc_paint_char_32(xx, yy, ch, attrs, ch_previous,
-@@ -1697,19 +1789,20 @@ vc_enable(boolean_t enable)
+@@ -1697,19 +1799,20 @@ vc_enable(boolean_t enable)
  	vc_render_font(enable ? vinfo.v_depth : 0);
  }
  
@@ -4016,7 +4039,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  	for (line = 0; line < ISO_CHAR_HEIGHT; line++) {
  		switch (vinfo.v_depth) {
  		case 8:
-@@ -1721,13 +1814,64 @@ vc_reverse_cursor(unsigned int xx, unsigned int yy)
+@@ -1721,13 +1824,64 @@ vc_reverse_cursor(unsigned int xx, unsigned int yy)
  				where[col] = ~where[col];
  			}
  			break;
@@ -4082,7 +4105,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  	}
  }
  
-@@ -1739,6 +1883,10 @@ vc_scroll_down(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
+@@ -1739,6 +1893,10 @@ vc_scroll_down(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
  	if (!vinfo.v_depth) {
  		return;
  	}
@@ -4093,7 +4116,7 @@ index 384118e8d7a9..fb5e685dd27a 100644
  
  	linelongs = vinfo.v_rowbytes * (ISO_CHAR_HEIGHT >> 2);
  	rowline = vinfo.v_rowbytes >> 2;
-@@ -1773,6 +1921,10 @@ vc_scroll_up(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
+@@ -1773,6 +1931,10 @@ vc_scroll_up(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
  	if (!vinfo.v_depth) {
  		return;
  	}
@@ -4104,7 +4127,16 @@ index 384118e8d7a9..fb5e685dd27a 100644
  
  	linelongs = vinfo.v_rowbytes * (ISO_CHAR_HEIGHT >> 2);
  	rowline = vinfo.v_rowbytes >> 2;
-@@ -2846,7 +2998,7 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+@@ -2653,7 +2815,7 @@ vc_progress_task(__unused void *arg0, __unused void *arg)
+ 
+ 	simple_lock(&vc_progress_lock, LCK_GRP_NULL);
+ 
+-	if (vc_progress_enable) {
++	if (vc_progress_enable && !hackios_graphics_owned) {   /* (HAKIOS: no spinner over the frame) */
+ 		do {
+ 			vc_progress_count++;
+ 			if (vc_progress_count >= vc_progress->count) {
+@@ -2846,7 +3008,7 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  			    new_vinfo.v_physaddr, new_vinfo.v_width, new_vinfo.v_height, new_vinfo.v_rowbytes, new_vinfo.v_type);       /* (BRINGUP) */
  		}
  
@@ -4113,6 +4145,38 @@ index 384118e8d7a9..fb5e685dd27a 100644
  			kprintf("initialize_screen: No video - forcing serial mode\n");         /* (BRINGUP) */
  			new_vinfo.v_depth = 0;                                          /* vc routines are nop */
  			(void)switch_to_serial_console();                               /* Switch into serial mode */
+@@ -2855,18 +3017,27 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 			gc_acquired = TRUE;
+ 		} else {
+ 			if (makeMapping) {
+-#if HAS_UCNORMAL_MEM
+ 				/*
+ 				 * Framebuffers would normally use VM_WIMG_RT, which
+ 				 * io_map doesn't support.  However this buffer is set up
+ 				 * by the bootloader and doesn't require D$ cleaning, so
+ 				 * VM_WIMG_RT and VM_WIMG_WCOMB are functionally
+ 				 * equivalent.
++				 *
++				 * (HAKIOS) Always WCOMB, not only on platforms that say
++				 * HAS_UCNORMAL_MEM.  The panel is 24 bits a pixel, so a
++				 * pixel is at x * 3: half of them are not 2-byte aligned
++				 * and the compiler merges two of the three byte stores
++				 * into an strh (drawLayer/store_pixel, and the 16-bit
++				 * console paths here).  Unaligned stores are fine in
++				 * normal memory but fault in Device memory, which is what
++				 * VM_WIMG_IO gives -- the kernel panics with "Unaligned
++				 * kernel data abort" on the first frame it draws.
++				 * WCOMB is normal non-cacheable, so unaligned accesses are
++				 * legal, and it is also the mapping Apple's own hardware
++				 * uses for the boot framebuffer.
+ 				 */
+ 				unsigned int flags = VM_WIMG_WCOMB;
+-#else
+-				unsigned int flags = VM_WIMG_IO;
+-#endif
+ 				if (boot_vinfo->v_length != 0) {
+ 					newMapSize = (unsigned int) round_page(boot_vinfo->v_length);
+ 				} else {
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
 index 0a00656a0fdd..493309d01500 100644
 --- a/osfmk/kern/debug.c
@@ -4785,7 +4849,7 @@ index c622b4cc84ab..370e2af40204 100644
  
  void
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
-index 65144c74239c..b5c18258e1a2 100644
+index 65144c74239c..70c4ff8bd979 100644
 --- a/pexpert/arm/pe_kprintf.c
 +++ b/pexpert/arm/pe_kprintf.c
 @@ -29,6 +29,7 @@ SECURITY_READ_ONLY_LATE(bool) enable_dklog_serial_output = false;
@@ -4815,7 +4879,7 @@ index 65144c74239c..b5c18258e1a2 100644
  }
  STARTUP(KPRINTF, STARTUP_RANK_FIRST, PE_init_kprintf);
  
-@@ -159,13 +152,20 @@ serial_putc_crlf(char c)
+@@ -159,13 +152,27 @@ serial_putc_crlf(char c)
  	if (c == '\n') {
  		uart_putc('\r');
  	}
@@ -4827,12 +4891,19 @@ index 65144c74239c..b5c18258e1a2 100644
  serial_putc_options(char c, bool poll)
  {
 +	extern void vcputc_direct(char c);
++	extern int hackios_graphics_owned;     /* iokit/Kernel/MiniIOMobileFramebuffer.cpp: set once the first frame is drawn */
 +	loader_log_putc(c);
  	uart_putc_options(c, poll);
-+	if (c == '\n') {
-+		vcputc_direct('\r');
++	/* (HAKIOS) the panel is CoreAnimation's from the first frame on: mirroring the log
++	 * to it here was wiping every frame the driver drew (one IOLog line painted one
++	 * console line over the picture).  Panics still reach the panel: debug.c calls
++	 * vcputc_direct() itself, without going through here. */
++	if (!hackios_graphics_owned) {
++		if (c == '\n') {
++			vcputc_direct('\r');
++		}
++		vcputc_direct(c);
 +	}
-+	vcputc_direct(c);
  }
  
  void
