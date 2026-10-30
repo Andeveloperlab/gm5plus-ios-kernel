@@ -179,6 +179,10 @@ cp obj/child root/bin/child
 [ -f obj/var_store ] && cp obj/var_store root/bin/
 cp com.hakios.varstore.plist root/LaunchDaemons/
 echo "Darwin on hakios: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
+# RAIN=1: the marker the window server looks for (src/inject.c, rain_later).  With it in the image
+# the board brings itself back to the shim's shell five minutes after the window server starts,
+# which is the way an unattended run returns to fastboot without a hand on VOL-DOWN.
+if [ "$RAIN" = "1" ]; then : > root/etc/rain; fi
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
 # EXTRA_SHARE: whole directories of data for a one-off diagnostic, each under its own name. Here and

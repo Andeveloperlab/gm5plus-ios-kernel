@@ -43,6 +43,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <signal.h>
 #include <sys/ucontext.h>
@@ -2077,61 +2079,6 @@ static id hooked_serverWithOptions(id self, SEL _cmd, id options) {
 }
 
 
-/* ---- hakios: direct IOMFB swap probe (kernel SwapBegin/SwapEnd path check, independent of QuartzCore) ---- */
-#include <pthread.h>
-typedef void *hk_fb_t;
-static void *
-hakios_swap_probe(void *arg)
-{
-	int (*getMain)(hk_fb_t *) = (int (*)(hk_fb_t *))dlsym(RTLD_DEFAULT, "IOMobileFramebufferGetMainDisplay");
-	int (*swapBegin)(hk_fb_t, uint32_t *) = (int (*)(hk_fb_t, uint32_t *))dlsym(RTLD_DEFAULT, "IOMobileFramebufferSwapBegin");
-	int (*swapSetLayer)(hk_fb_t, int, void *, const void *, const void *, uint32_t) =
-	    (int (*)(hk_fb_t, int, void *, const void *, const void *, uint32_t))dlsym(RTLD_DEFAULT, "IOMobileFramebufferSwapSetLayer");
-	int (*swapEnd)(hk_fb_t) = (int (*)(hk_fb_t))dlsym(RTLD_DEFAULT, "IOMobileFramebufferSwapEnd");
-	void *(*surfCreate)(CFDictionaryRef) = (void *(*)(CFDictionaryRef))dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
-	void *(*surfBase)(void *) = (void *(*)(void *))dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
-	hk_fb_t fb = NULL;
-	struct { float x, y, w, h; } rect = { 0, 0, 1125, 2436 };
-
-	(void)arg;
-	sleep(45);
-	if (!getMain || !swapBegin || !swapSetLayer || !swapEnd || !surfCreate || !surfBase) {
-		say("hakios: swap probe: symbols missing (%p %p %p %p %p %p)\n", getMain, swapBegin, swapSetLayer, swapEnd, surfCreate, surfBase);
-		return NULL;
-	}
-	int r = getMain(&fb);
-	say("hakios: swap probe: GetMainDisplay -> %#x fb=%p\n", r, fb);
-	int w = 1125, h = 2436, bpr = w * 4, fmt = 'BGRA', bpe = 4;
-	size_t alloc = (size_t)bpr * h;
-	CFNumberRef nw = CFNumberCreate(NULL, kCFNumberIntType, &w), nh = CFNumberCreate(NULL, kCFNumberIntType, &h);
-	CFNumberRef nb = CFNumberCreate(NULL, kCFNumberIntType, &bpr), nf = CFNumberCreate(NULL, kCFNumberIntType, &fmt);
-	CFNumberRef ne = CFNumberCreate(NULL, kCFNumberIntType, &bpe), na = CFNumberCreate(NULL, kCFNumberLongType, &alloc);
-	const void *k[] = { CFSTR("IOSurfaceWidth"), CFSTR("IOSurfaceHeight"), CFSTR("IOSurfaceBytesPerRow"),
-	    CFSTR("IOSurfacePixelFormat"), CFSTR("IOSurfaceBytesPerElement"), CFSTR("IOSurfaceAllocSize") };
-	const void *v[] = { nw, nh, nb, nf, ne, na };
-	CFDictionaryRef d = CFDictionaryCreate(NULL, k, v, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	void *surf = surfCreate(d);
-	say("hakios: swap probe: surface %p\n", surf);
-	if (!surf || !fb) {
-		return NULL;
-	}
-	uint32_t *px = (uint32_t *)surfBase(surf);
-	for (int y = 0; y < h; y++) {
-		for (int x = 0; x < w; x++) {
-			px[(size_t)y * w + x] = 0xFF000000u | ((x * 255 / w) << 16) | ((y * 255 / h) << 8) | 0x40;
-		}
-	}
-	for (int i = 0; i < 3; i++) {
-		uint32_t id = 0;
-		int a = swapBegin(fb, &id);
-		int b = swapSetLayer(fb, 0, surf, &rect, &rect, 0);
-		int c = swapEnd(fb);
-		say("hakios: swap probe #%d: begin=%#x(id %u) setLayer=%#x end=%#x\n", i, a, id, b, c);
-		sleep(2);
-	}
-	return NULL;
-}
-
 static void
 cawindowserver_trace_fixes(void)
 {
@@ -2146,6 +2093,705 @@ cawindowserver_trace_fixes(void)
 	} else {
 		say("hakios: CAWindowServer class not found\n");
 	}
+}
+
+/* ============================================================================
+ * The window server's own "take no updates" flag
+ * ============================================================================ */
+
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+
+/*
+ * QuartzCore keeps a flag that tells the window server to take no updates at all, and backboardd
+ * sets it on its way up -- that is its own log line "StartWindowServer: disabling framebuffer
+ * changes on display (1) at boot until we are ready for them" -- meaning to clear it when the
+ * display becomes ready.  While it is set the window server allocates no display surfaces and never
+ * swaps, which is exactly what the phone does (fix49: no MiniIOSurface at all, no selector 4 or 5,
+ * no registerNotificationPort, and the panel left the colour the shim gave it).  On a real phone the
+ * ready signal comes from the display subsystem (IOMobileFramebuffer's power state and
+ * CoreBrightness); both are bypassed here, so nobody ever clears the flag.
+ *
+ * fix51 could not name the global through dyld and stopped.  fix52 let dlsym name it -- 0x1f2bc2730,
+ * holding 120, no boolean -- and the first write to it cost backboardd a SIGBUS.  The kernel logged
+ * the reason: "[UX_EXCEPTION] exc=1 code=0x2" is EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE, and it
+ * repeated for every generation of the window server (fix52 crashed four of them).  Writable data
+ * in QuartzCore would take the write, so what dlsym named sits in a read-only mapping: it is not
+ * where backboardd's own write lands.
+ *
+ * Where it lands can be read out of the dyld shared cache without dyld's help.  dyld binds an
+ * executable's references through the export trie of the defining image, the trie's offsets are
+ * offsets into the cache file, and the file begins where the cache is mapped -- so the address the
+ * trie gives for _kCAWindowServerDisableUpdatesOnMainDisplay is the address dyld handed to
+ * backboardd.  That is the flag.  Even its page can be mapped read-only until somebody's first
+ * write unnests it, so nothing is ever written before make_writable() has made the page take
+ * writes: ask for the bit, and if that is refused, put a private copy of the page in its place.
+ *
+ * The watch of QuartzCore's writable data from fix52 stays as the witness: when backboardd sets the
+ * flag it must show as one bit turning 0 -> 1, independent proof of where the flag really lives.
+ */
+struct hakios_data_region {
+	uintptr_t start;
+	uint64_t  words;                 /* 8-byte words of it */
+};
+
+/* The writable segments of QuartzCore, and where the image starts. */
+static int
+hakios_quartzcore_data(uintptr_t *base_out, struct hakios_data_region *regions, int max_regions)
+{
+	for (uint32_t image = 0; image < _dyld_image_count(); image++) {
+		const char *path = _dyld_get_image_name(image);
+		const struct mach_header_64 *header;
+		const uint8_t *command;
+		intptr_t slide;
+		int found = 0;
+
+		if (path == NULL || strstr(path, "/QuartzCore") == NULL) {
+			continue;
+		}
+		header = (const struct mach_header_64 *) _dyld_get_image_header(image);
+		slide = _dyld_get_image_vmaddr_slide(image);
+		if (base_out != NULL) {
+			*base_out = (uintptr_t) header;
+		}
+		command = (const uint8_t *) (header + 1);
+		for (uint32_t n = 0; n < header->ncmds; n++) {
+			const struct segment_command_64 *seg = (const struct segment_command_64 *) command;
+
+			if (seg->cmd == LC_SEGMENT_64 && seg->vmsize >= 8 && seg->vmsize <= 0x4000000
+			    && (strcmp(seg->segname, "__DATA") == 0 || strcmp(seg->segname, "__DATA_DIRTY") == 0)) {
+				if (regions != NULL && found < max_regions) {
+					regions[found].start = (uintptr_t) seg->vmaddr + (uintptr_t) slide;
+					regions[found].words = seg->vmsize / 8;
+				}
+				found++;
+			}
+			command += seg->cmdsize;
+		}
+		return found;
+	}
+	return 0;
+}
+
+/* A ULEB128; NULL when it would run past `end` or past 64 bits. */
+static const uint8_t *
+uleb128(const uint8_t *p, const uint8_t *end, uint64_t *out)
+{
+	uint64_t value = 0;
+	int shift = 0;
+
+	while (p < end) {
+		uint8_t byte = *p++;
+
+		value |= (uint64_t) (byte & 0x7f) << shift;
+		if ((byte & 0x80) == 0) {
+			*out = value;
+			return p;
+		}
+		shift += 7;
+		if (shift >= 64) {
+			return NULL;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Read from our own address space without taking a fault.  vm_read_overwrite answers
+ * KERN_INVALID_ADDRESS for what is not mapped, where a plain dereference answers with a signal --
+ * fix54 computed a trie address (0x8dfbf730) that nothing had mapped, read it while walking what
+ * it believed was a trie, and the window server fell with SIGSEGV before printing one line.  Every
+ * address this file computes is proven readable here before anything touches it.
+ */
+static int
+safe_copy(uintptr_t from, void *into, size_t length)
+{
+	mach_msg_type_number_t given = 0;
+	kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t) from, (vm_size_t) length,
+	                                     (vm_address_t) into, &given);
+
+	return kr == KERN_SUCCESS && given == (mach_msg_type_number_t) length;
+}
+
+static int
+peek_byte(uintptr_t where, unsigned char *out)
+{
+	return safe_copy(where, out, 1);
+}
+
+struct hakios_cache_mapping {
+	uint64_t address;      /* where these bytes are mapped, as the cache prefers it */
+	uint64_t size;
+	uint64_t file_offset;  /* which bytes of the cache file they are */
+};
+
+/*
+ * The shared cache header sits at the first byte of the mapping and its mapping table is the
+ * ground truth between a file offset in the cache file and the address it lives at.  fix54
+ * bridged through the image's __LINKEDIT segment alone and trusted the answer; the table is the
+ * second opinion, and whatever either bridge says is proven with safe_copy() before it is read.
+ */
+static int
+hakios_cache_mappings(struct hakios_cache_mapping *into, int max)
+{
+	uint8_t head[0x20];
+	const void *cache = _dyld_get_shared_cache_range(NULL);
+	uint32_t offset;
+	uint32_t count;
+	int n;
+
+	if (cache == NULL || !safe_copy((uintptr_t) cache, head, sizeof(head))
+	    || memcmp(head, "dyld_v1", 7) != 0) {
+		return 0;
+	}
+	memcpy(&offset, head + 0x10, sizeof(offset));
+	memcpy(&count, head + 0x14, sizeof(count));
+	if (count == 0 || count > (uint32_t) max) {
+		return 0;
+	}
+	if (offset == 0 || !safe_copy((uintptr_t) cache + offset, into, count * sizeof(*into))) {
+		return 0;
+	}
+	for (n = 0; n < (int) count; n++) {
+		if (into[n].size == 0 || into[n].size > 0x400000000ULL) {
+			return 0;
+		}
+	}
+	return (int) count;
+}
+
+static uintptr_t
+hakios_runtime_for_file(uint64_t fileoff, int count, const struct hakios_cache_mapping *mappings,
+                        uintptr_t slide)
+{
+	int n;
+
+	for (n = 0; n < count; n++) {
+		if (fileoff >= mappings[n].file_offset && fileoff - mappings[n].file_offset < mappings[n].size) {
+			return (uintptr_t) (mappings[n].address + slide + (fileoff - mappings[n].file_offset));
+		}
+	}
+	return 0;
+}
+
+/*
+ * Walk the export trie for one symbol name and read the address it exports.  The trie is the one
+ * from Apple's dyld: a node is a terminal length, that many bytes of terminal payload, an edge
+ * count, and per edge a label and the child's offset from the trie's start.  A terminal payload is
+ * flags and then, for an ordinary export, the unslid address.
+ */
+static int
+hakios_trie_lookup(const uint8_t *trie, const uint64_t size, const char *symbol, uint64_t *address_out)
+{
+	const uint8_t *end = trie + size;
+	uint64_t node = 0;
+	const char *rest = symbol;
+
+	/* One hop consumes at least one character of the name, so 64 is plenty for any symbol. */
+	for (int hop = 0; hop < 64; hop++) {
+		const uint8_t *p;
+		uint64_t terminal;
+		uint64_t edges;
+		uint64_t descended = 0;
+
+		if (node >= size) {
+			return 0;
+		}
+		p = trie + node;
+		if ((p = uleb128(p, end, &terminal)) == NULL || (uint64_t) (p - trie) + terminal > size) {
+			return 0;
+		}
+		p += terminal;
+		if ((p = uleb128(p, end, &edges)) == NULL || edges > 1024) {
+			return 0;
+		}
+		for (uint64_t edge = 0; edge < edges; edge++) {
+			const char *label = (const char *) p;
+			uint64_t child;
+			size_t length;
+
+			if (p >= end) {
+				return 0;
+			}
+			length = strnlen(label, (size_t) (end - p));
+			if (length == 0 || length == (size_t) (end - p)) {
+				return 0;
+			}
+			p += length + 1;
+			if ((p = uleb128(p, end, &child)) == NULL) {
+				return 0;
+			}
+			/*
+			 * A trie is serialized with every child behind its parent, so a pointer backwards or
+			 * out of the trie means the bytes are not a trie after all.  fix53 learned this the
+			 * hard way: it walked what it thought was a trie and spun inside a cycle forever.
+			 */
+			if (child <= node || child >= size) {
+				return 0;
+			}
+			if (descended == 0 && strncmp(rest, label, length) == 0) {
+				descended = child;
+				rest += length;
+			}
+		}
+		if (*rest == 0 && descended != 0) {
+			uint64_t flags;
+			uint64_t target;
+			const uint8_t *q;
+
+			node = descended;
+			if ((q = uleb128(trie + node, end, &terminal)) == NULL || terminal == 0) {
+				return 0;
+			}
+			if ((q = uleb128(q, end, &flags)) == NULL) {
+				return 0;
+			}
+			if (flags & 0x10) {
+				return 0;                                    /* a re-export: the name lives in another image */
+			}
+			if ((q = uleb128(q, end, &target)) == NULL) {
+				return 0;
+			}
+			*address_out = target;
+			return 1;
+		}
+		if (descended == 0) {
+			return 0;
+		}
+		node = descended;
+	}
+	return 0;
+}
+
+/*
+ * Where dyld binds `symbol` for the process: the export trie of the image that defines it
+ * (QuartzCore here) holds the address dyld hands to every executable that references it.
+ *
+ * The load commands give the trie's offset in the cache FILE, and the cache is split on disk
+ * (.01 ... .42, .dylddata, .dyldlinkedit), so that offset does not count from where the cache is
+ * mapped in this process -- fix53 assumed it did, walked a text region as if it were a trie, and
+ * spun in a cycle forever without printing one line.  fix54 bridged through the image's own
+ * __LINKEDIT segment, which is right only while that segment's bytes lie contiguous in memory,
+ * and then trusted the computed address: it was wrong, unmapped, and reading it took the window
+ * server down with SIGSEGV before a single line was printed.  Since fix55 there are two bridges
+ * (the segment and the cache header's own mapping table), every candidate address is proven with
+ * safe_copy() and copied locally before it is walked, and the answer must land inside one of
+ * QuartzCore's own data segments to be believed at all.
+ */
+static int
+hakios_export_address(const char *symbol, uintptr_t *address_out)
+{
+	size_t cache_length = 0;
+	const void *cache = _dyld_get_shared_cache_range(&cache_length);
+	struct hakios_cache_mapping mappings[16];
+	int count = hakios_cache_mappings(mappings, 16);
+	uintptr_t cache_slide = 0;
+	static int told = 0;
+	int n;
+
+	for (n = 0; n < count; n++) {
+		if (mappings[n].file_offset == 0) {
+			cache_slide = (uintptr_t) cache - (uintptr_t) mappings[n].address;
+		}
+	}
+
+	for (uint32_t image = 0; image < _dyld_image_count(); image++) {
+		const char *path = _dyld_get_image_name(image);
+		const struct mach_header_64 *header;
+		const uint8_t *command;
+		uintptr_t slide;
+		uint64_t link_vmaddr = 0;
+		uint64_t link_fileoff = 0;
+		uint64_t link_filesize = 0;
+		uint64_t trie_offset = 0;
+		uint64_t trie_size = 0;
+		uintptr_t candidates[3];
+		uint64_t data_start[8];
+		uint64_t data_size[8];
+		uint32_t codes[192];
+		int code_count = 0;
+		int data_count = 0;
+		int candidate_count = 0;
+
+		if (path == NULL || strstr(path, "/QuartzCore") == NULL) {
+			continue;
+		}
+		header = (const struct mach_header_64 *) _dyld_get_image_header(image);
+		slide = (uintptr_t) _dyld_get_image_vmaddr_slide(image);
+		command = (const uint8_t *) (header + 1);
+		for (uint32_t c = 0; c < header->ncmds; c++) {
+			const struct segment_command_64 *segment = (const struct segment_command_64 *) command;
+
+			if (code_count < 192) {
+				codes[code_count++] = segment->cmd;
+			}
+			if (segment->cmd == LC_SEGMENT_64) {
+				if (strcmp(segment->segname, "__LINKEDIT") == 0) {
+					link_vmaddr = segment->vmaddr;
+					link_fileoff = segment->fileoff;
+					link_filesize = segment->filesize;
+				} else if (strncmp(segment->segname, "__DATA", 6) == 0
+				           || strncmp(segment->segname, "__AUTH", 6) == 0) {
+					if (data_count < 8) {
+						data_start[data_count] = segment->vmaddr + (uint64_t) slide;
+						data_size[data_count] = segment->vmsize;
+					}
+					data_count++;
+				}
+			} else if (segment->cmd == LC_DYLD_INFO_ONLY) {
+				const struct dyld_info_command *info = (const struct dyld_info_command *) command;
+
+				trie_offset = info->export_off;
+				trie_size = info->export_size;
+			} else if (segment->cmd == LC_DYLD_EXPORTS_TRIE) {
+				const struct linkedit_data_command *tried = (const struct linkedit_data_command *) command;
+
+				trie_offset = tried->dataoff;
+				trie_size = tried->datasize;
+			}
+			command += segment->cmdsize;
+		}
+		/*
+		 * fix55 printed none of this because the check below ran first and QuartzCore's
+		 * trie_size was zero -- so the load commands come out whatever they hold, export
+		 * table or not.  The command codes join the report for the same reason: guessing
+		 * which load commands a 16.5 cache image carries is guessing blind.
+		 */
+		if (!told) {
+			told = 1;
+			say("hakios: cache at %p length %#lx, its slide %#lx\n", cache,
+			    (unsigned long) cache_length, (unsigned long) cache_slide);
+			say("hakios: QuartzCore at %#lx linkedit vmaddr %#llx fileoff %#llx size %#llx; trie "
+			    "fileoff %#llx size %#llx\n", (unsigned long) header,
+			    (unsigned long long) link_vmaddr, (unsigned long long) link_fileoff,
+			    (unsigned long long) link_filesize, (unsigned long long) trie_offset,
+			    (unsigned long long) trie_size);
+			for (n = 0; n < count; n++) {
+				say("hakios:   cache file %#llx -> %#llx (%#llx bytes)\n",
+				    (unsigned long long) mappings[n].file_offset,
+				    (unsigned long long) mappings[n].address,
+				    (unsigned long long) mappings[n].size);
+			}
+			for (n = 0; n < code_count; n++) {
+				say("hakios:   cmd %d: %#x%s", n, codes[n], (n % 4 == 3 || n + 1 == code_count) ? "\n" : "  ");
+			}
+		}
+
+		if (trie_size == 0 || trie_size > (1u << 22)) {
+			continue;
+		}
+
+		/* Candidate one: the image's __LINKEDIT bridge, valid while the segment is contiguous. */
+		if (link_filesize != 0 && trie_offset >= link_fileoff
+		    && trie_offset + trie_size <= link_fileoff + link_filesize) {
+			candidates[candidate_count++] =
+			    slide + (uintptr_t) link_vmaddr + (uintptr_t) (trie_offset - link_fileoff);
+		}
+		/* Candidate two: the cache header's mapping table, which knows the file's layout. */
+		if (count != 0) {
+			uintptr_t by_table = hakios_runtime_for_file(trie_offset, count, mappings, cache_slide);
+
+			if (by_table != 0) {
+				candidates[candidate_count++] = by_table;
+			}
+		}
+		/* Candidate three: fix53's naive guess, harmless now that reads go through safe_copy. */
+		if (cache != NULL) {
+			candidates[candidate_count++] = (uintptr_t) cache + (uintptr_t) trie_offset;
+		}
+
+		{
+			static int told_candidates = 0;
+
+			if (!told_candidates) {
+				told_candidates = 1;
+				for (n = 0; n < candidate_count; n++) {
+					say("hakios:   trie candidate %d at %#lx\n", n, (unsigned long) candidates[n]);
+				}
+			}
+		}
+
+		for (n = 0; n < candidate_count; n++) {
+			uint8_t *local;
+			uint64_t target = 0;
+
+			if (candidates[n] == 0 || (local = malloc((size_t) trie_size)) == NULL) {
+				continue;
+			}
+			if (safe_copy(candidates[n], local, (size_t) trie_size)
+			    && hakios_trie_lookup(local, trie_size, symbol, &target)) {
+				uintptr_t runtime = (uintptr_t) slide + (uintptr_t) target;
+				int holds = 0;
+				int r;
+
+				free(local);
+				for (r = 0; r < data_count && r < 8; r++) {
+					if (runtime >= data_start[r] && runtime - data_start[r] < data_size[r]) {
+						holds = 1;
+					}
+				}
+				if (data_count != 0 && !holds) {
+					say("hakios: the trie's answer %#lx is outside QuartzCore's data segments, "
+					    "not believed\n", (unsigned long) runtime);
+					continue;
+				}
+				*address_out = runtime;
+				return 1;
+			}
+			free(local);
+		}
+	}
+	return 0;
+}
+
+/*
+ * Make the page holding `where` take a write.  fix52 showed the fault the naive way: the cache
+ * maps some of its data read-only and the kernel answers a write with KERN_PROTECTION_FAILURE --
+ * SIGBUS, not a refusal a program can see coming.  Asking for the bit is the cheap way; when it is
+ * refused, the page is replaced by a private anonymous copy with the same bytes on it.  Only this
+ * process sees the copy, which for a flag the window server sets for itself is exactly right.
+ */
+static int
+make_writable(uintptr_t where)
+{
+	size_t pagesize = (size_t) getpagesize();
+	uintptr_t page = where & ~(pagesize - 1);
+	unsigned char *spare;
+	void *placed;
+
+	if (mprotect((void *) page, pagesize, PROT_READ | PROT_WRITE) == 0) {
+		return 1;
+	}
+	say("hakios: mprotect of %#lx failed (errno %d), copying the page private\n",
+	    (unsigned long) page, errno);
+	if ((spare = malloc(pagesize)) == NULL) {
+		return 0;
+	}
+	memcpy(spare, (const void *) page, pagesize);
+	placed = mmap((void *) page, pagesize, PROT_READ | PROT_WRITE,
+	              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	if (placed != (void *) page) {
+		free(spare);
+		say("hakios: no page to give, %#lx wanted %#p\n", (unsigned long) page, placed);
+		return 0;
+	}
+	memcpy((void *) page, spare, pagesize);
+	free(spare);
+	return 1;
+}
+
+static void *
+unfreeze_window_server(void *arg)
+{
+	static const char *const symbol = "_kCAWindowServerDisableUpdatesOnMainDisplay";
+	/*
+	 * fix55 learned the hard way what names dlsym may be given here: the C name without the
+	 * leading underscore sent dyld's own lookup down a path that executed data -- pc landed in
+	 * the cache's local symbols blob (0x1a45d0928) dereferencing NULL, and every generation of
+	 * the window server died on it.  Only the underscored name, as the symbol table spells it,
+	 * is safe to ask for.
+	 */
+	static const char *const names[] = {
+		"_kCAWindowServerDisableUpdatesOnMainDisplay",     /* as the symbol table spells it */
+	};
+	volatile unsigned char *flag = NULL;                   /* where the export trie puts it */
+	volatile unsigned char *lookalike = NULL;              /* where dlsym puts it, for the record */
+	uintptr_t quartzcore = 0;
+	uintptr_t exported = 0;
+	struct hakios_data_region regions[4];
+	uint64_t *was;
+	uint64_t words = 0;
+	int region_count;
+	int cleared = 0;
+	int reported = 0;
+	int complained = 0;
+	unsigned int started = 0;
+	unsigned char byte = 0;
+
+	(void) arg;
+	/*
+	 * Wait for QuartzCore to be mapped -- its load commands are what every step below reads --
+	 * and snapshot its writable data immediately.  The snapshot has to precede backboardd's own
+	 * write of the freeze flag (~60 s into its boot) or the watch sees nothing; whether the trie
+	 * bridges reach the export data is decided the same moment QuartzCore is mapped, so that hunt
+	 * comes second and is tried once.
+	 */
+	for (int attempt = 0; attempt < 240; attempt++) {
+		region_count = hakios_quartzcore_data(&quartzcore, regions, 4);
+		if (region_count != 0) {
+			break;
+		}
+		usleep(250000);
+	}
+	if (region_count == 0) {
+		say("hakios: QuartzCore is not loaded, giving up on the freeze flag\n");
+		return NULL;
+	}
+	for (int region = 0; region < region_count; region++) {
+		words += regions[region].words;
+	}
+	if ((was = calloc((size_t) words, sizeof(*was))) == NULL) {
+		return NULL;
+	}
+	say("hakios: watching %llu words of QuartzCore's data for the flag\n", (unsigned long long) words);
+	{
+		uint64_t start_of = 0;
+
+		for (int region = 0; region < region_count; region++) {
+			memcpy(was + start_of, (const void *) regions[region].start, (size_t) regions[region].words * 8);
+			start_of += regions[region].words;
+		}
+	}
+	if (hakios_export_address(symbol, &exported)) {
+		flag = (volatile unsigned char *) exported;
+	}
+	if (flag != NULL) {
+		unsigned char window[128];
+		uintptr_t low = (uintptr_t) flag & ~(uintptr_t) 7;
+
+		if (!peek_byte((uintptr_t) flag, &byte)) {
+			say("hakios: the export trie puts the freeze flag at %p, but nothing is mapped there\n",
+			    (void *) flag);
+			flag = NULL;
+		} else {
+			started = byte;
+			say("hakios: the freeze flag is at %p (where dyld binds it), it starts at %u\n",
+			    (void *) flag, started);
+			if (safe_copy(low, window, sizeof(window))) {
+				for (int n = 0; n < 16; n++) {
+					say("hakios:   %#lx: %#02x\n", (unsigned long) (low + n * 8),
+					    (unsigned int) window[n * 8]);
+				}
+			}
+		}
+	} else {
+		say("hakios: QuartzCore's export trie does not name the freeze flag\n");
+	}
+	for (unsigned name = 0; name < sizeof(names) / sizeof(names[0]) && lookalike == NULL; name++) {
+		lookalike = (volatile unsigned char *) dlsym(RTLD_DEFAULT, names[name]);
+	}
+	if (lookalike != NULL) {
+		Dl_info info;
+
+		if (dladdr((const void *) lookalike, &info) && info.dli_sname != NULL
+		    && strcmp(info.dli_sname, symbol) == 0) {
+			say("hakios: dlsym's %p is the flag too, by dladdr (%s)\n", (void *) lookalike, info.dli_sname);
+			if (flag == NULL && peek_byte((uintptr_t) lookalike, &byte)) {
+				flag = lookalike;
+				started = byte;
+			}
+		} else {
+			say("hakios: dlsym names %p: %s in %s -- not the flag, reading only\n", (void *) lookalike,
+			    info.dli_sname != NULL ? info.dli_sname : "no name",
+			    info.dli_fname != NULL ? info.dli_fname : "no image");
+		}
+	}
+	if (flag == NULL) {
+		say("hakios: no way to the freeze flag, watching QuartzCore's data alone\n");
+	}
+	for (int round = 0; round < 1200; round++) {
+		uint64_t cursor = 0;
+
+		for (int region = 0; region < region_count; region++) {
+			for (uint64_t word = 0; word < regions[region].words; word++) {
+				uint64_t now = *(const uint64_t *) (regions[region].start + word * 8);
+
+				if (now != was[cursor + word]) {
+					uint64_t at = regions[region].start + word * 8 - quartzcore;
+					uint64_t xor = now ^ was[cursor + word];
+					int bits = 0, bit = -1, set = 0;
+
+					for (int n = 0; n < 64; n++) {
+						if ((xor >> n) & 1) {
+							bits++;
+							bit = n;
+						}
+					}
+					if (bits == 1) {
+						set = (int) ((now >> bit) & 1);
+					}
+					if (bits != 1 || !set) {
+						/* data that moves in QuartzCore is normal; what is looked for is a flag
+						 * being set, one bit, 0 -> 1 */
+						was[cursor + word] = now;
+						continue;
+					}
+					say("hakios: QuartzCore + 0x%llx (living at %#lx): %#llx -> %#llx (bit set)\n",
+					    (unsigned long long) at, (unsigned long) (regions[region].start + word * 8),
+					    (unsigned long long) was[cursor + word], (unsigned long long) now);
+					was[cursor + word] = now;
+					if (++reported >= 400) {
+						free(was);
+						say("hakios: enough changes reported, the freeze flag watch is over\n");
+						return NULL;
+					}
+				}
+			}
+			cursor += regions[region].words;
+		}
+		if (flag != NULL && cleared < 16) {
+			unsigned int frozen;
+
+			if (!peek_byte((uintptr_t) flag, &byte)) {
+				say("hakios: the freeze flag at %p went unreadable; leaving it alone\n", (void *) flag);
+				flag = NULL;
+			} else if ((frozen = byte) != 0) {
+				if (frozen > 1 && started > 1) {
+					/*
+					 * Not boolean, and not boolean from the first read either: this is somebody
+					 * else's byte, not the flag (fix52: dlsym's address held 120 and taking a
+					 * write there put the window server down with a protection fault).  Leave
+					 * the byte to its owner.
+					 */
+					if (!complained++) {
+						say("hakios: the freeze flag's byte holds %u, %u when found: no boolean, so "
+						    "no write\n", frozen, started);
+					}
+				} else if (make_writable((uintptr_t) flag)) {
+					unsigned char after = 0;
+
+					*flag = 0;
+					peek_byte((uintptr_t) flag, &after);
+					say("hakios: nothing ever tells the window server the display is ready: cleared "
+					    "the freeze flag (%d), %u -> %u\n", ++cleared, frozen, (unsigned int) after);
+				} else {
+					say("hakios: the freeze flag's page would not take the write, %u stays\n", frozen);
+					flag = NULL;
+				}
+			}
+		}
+		usleep(250000);
+	}
+	free(was);
+	say("hakios: freeze flag watch over, %d clears\n", cleared);
+	return NULL;
+}
+
+/*
+ * The rain: when /redwood/etc/rain is in the image, the window server brings the board down
+ * five minutes after it starts.  There is no other way back to fastboot from a booted XNU --
+ * halt_all_cpus() was turned into a wfe spin, so reboot(2) stops rather than resets -- and a
+ * person at the desk should not be required to hold VOL-DOWN through every iteration.  A signal
+ * that init is not shielded from (the kernel only spares launchd's SIGKILL, SIGTERM and SIGSTOP)
+ * ends launchd; XNU panics on that ("Always panic for launchd"), the patched panic path calls
+ * loader_return(), and the shim's USB shell is listening again on the same CDC-ACM port where
+ * "reboot" sends the board to fastboot.  tools/autoloop.py reads the shell's prompt and says it.
+ */
+static void *
+rain_later(void *arg)
+{
+	(void) arg;
+	for (int tick = 0; tick < 30; tick++) {
+		usleep(10000000);
+	}
+	say("hakios: the watch was enough; the rain comes (launchd will fall, the shim will catch)\n");
+	if (kill(1, SIGSEGV) != 0) {
+		say("hakios: launchd would not take the signal (errno %d)\n", errno);
+	}
+	for (;;) {
+		sleep(60);
+	}
+	return NULL;
 }
 
 /* ============================================================================
@@ -2503,13 +3149,12 @@ hakios_init(void)
 		size_t size = sizeof(arguments) - 1;
 
 		/*
-		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh
-		 * notifications. QuartzCore takes them (IOMobileFramebufferEnableVSyncNotifications) only on
-		 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment
-		 * (CADeviceUseVBL()); on the iPhone X it runs a timer of its own instead (CADisplayTimer),
-		 * whose phase it would set from the frame timings of a display driver this one is not.
-		 * On MSM8952, GICv2 timer IRQ is not delivered reliably, so CA_FORCE_TIMER=1 would cause
-		 * WindowServer to deadlock waiting for hardware VSync before first frame. Keep CA_FORCE_TIMER=0.
+		 * CA_FORCE_TIMER=0 (fix50 tried 1: the window server never reached "StartWindowServer"
+		 * at all and the board reset, so QuartzCore really does wait for a hardware VSync it
+		 * cannot get here).  With 0 the window server comes up and finishes its start, but it
+		 * never asks for refresh notifications either (no registerNotificationPort), and it never
+		 * commits a frame: no surface is ever allocated (fix49).  So the frame clock is not what
+		 * is holding the first frame back; something before it is.  See unfreeze_window_server().
 		 */
 		setenv("CA_FORCE_TIMER", "0", 1);
 		say("hakios: CA_FORCE_TIMER=0 set: CoreAnimation CADisplayTimer runs autonomously\n");
@@ -2537,7 +3182,17 @@ hakios_init(void)
 		window_server_fixes();
 		watch_for_faults();
 		cawindowserver_trace_fixes();
-		{ pthread_t t; pthread_create(&t, NULL, hakios_swap_probe, NULL); }
+		{ pthread_t t; pthread_create(&t, NULL, unfreeze_window_server, NULL); }
+		{
+			struct stat rainy;
+
+			if (stat("/redwood/etc/rain", &rainy) == 0) {
+				pthread_t t;
+
+				say("hakios: /redwood/etc/rain is here: the board goes to the shim after 300 s\n");
+				pthread_create(&t, NULL, rain_later, NULL);
+			}
+		}
 		hakios_install_cacontext_swap_trigger();
 		hakios_install_brightness_and_display_fixes();
 		hid_system_fixes();
